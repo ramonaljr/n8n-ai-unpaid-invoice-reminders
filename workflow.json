@@ -1,0 +1,2022 @@
+{
+  "name": "TalentBridge Staffing - AI Unpaid Invoice Reminders",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "id": "4408d8b8-dbef-444f-8efb-15586b710288",
+      "name": "Every Day At 8:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT invoice_id, invoice_number, customer_id, customer_name, contact_email,\n       collection_stage, days_overdue, last_contacted, last_response,\n       promise_to_pay_date, dispute_status, next_action_date, assigned_owner,\n       times_contacted\nFROM talentbridge.collection_state\nWHERE collection_stage <> 'closed';",
+        "options": {}
+      },
+      "id": "455224a4-376f-4cb6-bdb1-b9c48d035813",
+      "name": "Postgres - Load Collection State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "position": [
+        896,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const invoices = $('QuickBooks - Unpaid Invoices').all();\n// Pipedrive v1 returns one item holding a data array of organisations.\nconst orgs = $('Pipedrive - Customer Context').all()\n  .flatMap(i => Array.isArray((i.json || {}).data) ? i.json.data.map(o => ({ json: o })) : [i]);\nconst stateRows = $('Postgres - Load Collection State').all();\nconst qbCustomers = $('QuickBooks - Customers').all();\n\nconst DAY = 86400000;\nconst today = new Date();\ntoday.setHours(0, 0, 0, 0);\n\nfunction toDate(v) {\n  if (!v) return null;\n  const m = String(v).match(/\\/Date\\((\\d+)/);\n  const d = m ? new Date(Number(m[1])) : new Date(v);\n  if (isNaN(d.getTime())) return null;\n  d.setHours(0, 0, 0, 0);\n  return d;\n}\nfunction dayDiff(a, b) { return Math.round((a.getTime() - b.getTime()) / DAY); }\nfunction iso(d) { return d ? d.toISOString().slice(0, 10) : null; }\nfunction addDays(d, n) { return new Date(d.getTime() + n * DAY); }\n\n// Minimum days between contacts, per stage. Chasing daily is how you get\n// marked as spam and lose the relationship.\nconst CADENCE = { pre_due: 0, due: 0, od_1_7: 3, od_8_14: 3, od_15_30: 5, od_30_plus: 7 };\n\nconst orgByName = {};\nfor (const o of orgs) {\n  const n = String((o.json || {}).name || '').trim().toLowerCase();\n  if (n) orgByName[n] = o.json;\n}\n\n// Billing email comes from QuickBooks - Pipedrive organisations have no email\n// field. Order: an address saved in Postgres (from a wrong-contact reply), then\n// the customer's primary email (the maintained contact record), then the\n// invoice's billing email, which is only a copy taken when the invoice was made.\nconst emailByContactId = {};\nfor (const c of qbCustomers) {\n  const x = c.json || {};\n  const addr = (x.PrimaryEmailAddr || {}).Address;\n  if (x.Id && addr) emailByContactId[String(x.Id)] = String(addr).trim();\n}\n\nconst stateById = {};\nfor (const r of stateRows) {\n  const s = r.json || {};\n  if (s.invoice_id) stateById[s.invoice_id] = s;\n}\n\nconst out = [];\nconst seen = {};\n\nfor (const item of invoices) {\n  const inv = item.json || {};\n  const invoiceId = inv.Id ? String(inv.Id) : '';\n  if (!invoiceId) continue;\n  // All invoices are fetched, so paid and voided ones arrive here too. Leave\n  // them out of 'seen' so the close-paid step below closes them in Postgres.\n  const amountDue = Number(inv.Balance || 0);\n  if (amountDue <= 0) continue;\n  seen[invoiceId] = true;\n\n  const due = toDate(inv.DueDate);\n  if (!due) continue;\n\n  const daysOverdue = dayDiff(today, due);\n  let stage;\n  if (daysOverdue < 0) stage = 'pre_due';\n  else if (daysOverdue === 0) stage = 'due';\n  else if (daysOverdue <= 7) stage = 'od_1_7';\n  else if (daysOverdue <= 14) stage = 'od_8_14';\n  else if (daysOverdue <= 30) stage = 'od_15_30';\n  else stage = 'od_30_plus';\n\n  const st = stateById[invoiceId] || {};\n  const customerRef = inv.CustomerRef || {};\n  const customerName = String(customerRef.name || '');\n  const org = orgByName[customerName.trim().toLowerCase()] || {};\n\n  // ---- HARD STOPS ----\n  // A disputed invoice is never chased. Chasing a customer who has raised a\n  // dispute is how an AR process destroys an account.\n  if (String(st.dispute_status || 'none') === 'open') continue;\n  if (st.collection_stage === 'wrong_contact') continue;\n  // Only one final notice. After it goes out the account owner takes over\n  // (Pipedrive task); reminders restart only if someone changes the stage.\n  if (st.collection_stage === 'final_notice_sent') continue;\n  const nextAction = toDate(st.next_action_date);\n  if (nextAction && nextAction > today) continue;\n\n  // ---- PROMISE TO PAY ----\n  const promise = toDate(st.promise_to_pay_date);\n  let promiseBroken = false;\n  if (promise) {\n    if (promise >= today) continue;\n    promiseBroken = true;\n  }\n\n  // ---- CADENCE ----\n  const lastContacted = toDate(st.last_contacted);\n  const minGap = CADENCE[stage] || 3;\n  if (!promiseBroken && lastContacted && dayDiff(today, lastContacted) < minGap) continue;\n\n  // Pre-due is a single courtesy note 3 days out, never a repeated nag.\n  if (stage === 'pre_due') {\n    if (daysOverdue !== -3) continue;\n    if (lastContacted) continue;\n  }\n\n  const ownerObj = org.owner_id || {};\n  const timesContacted = Number(st.times_contacted || 0);\n  const contactEmail = st.contact_email || emailByContactId[String(customerRef.value || '')] || String((inv.BillEmail || {}).Address || '').trim() || '';\n\n  // No address means no email. Send it to a human instead of handing Gmail an\n  // empty recipient and failing the whole branch.\n  let action = 'chase';\n  if (!contactEmail) action = 'no_contact';\n  else if (stage === 'od_30_plus') action = 'final_notice';\n  else if (stage === 'pre_due' || stage === 'due') action = 'courtesy';\n\n  const subjectTail = daysOverdue > 0\n    ? ' is ' + daysOverdue + ' days overdue'\n    : (daysOverdue === 0 ? ' is due today' : ' falls due on ' + iso(due));\n\n  out.push({\n    json: {\n      action: action,\n      invoiceId: invoiceId,\n      invoiceNumber: inv.DocNumber || '',\n      customerId: String(customerRef.value || ''),\n      customerName: customerName,\n      contactEmail: contactEmail,\n      currency: (inv.CurrencyRef || {}).value || 'USD',\n      amountDue: amountDue,\n      invoiceTotal: Number(inv.TotalAmt || 0),\n      reference: (inv.CustomerMemo || {}).value || inv.PrivateNote || '',\n      dueDate: iso(due),\n      daysOverdue: daysOverdue,\n      collectionStage: stage,\n      promiseBroken: promiseBroken,\n      promiseDate: iso(promise),\n      lastContacted: iso(lastContacted),\n      timesContacted: timesContacted,\n      timesContactedNext: timesContacted + 1,\n      nextActionDate: iso(addDays(today, minGap || 3)),\n      accountOwner: ownerObj.name || st.assigned_owner || 'unassigned',\n      ownerEmail: ownerObj.email || '',\n      customerStatus: org.label || 'unknown',\n      pipedriveOrgId: org.id || null,\n      openDealsCount: Number(org.open_deals_count || 0),\n      emailSubject: 'TalentBridge Staffing - invoice ' + (inv.DocNumber || '') + subjectTail\n    }\n  });\n}\n\n// ---- CLOSE PAID ----\n// Anything open in Postgres that QuickBooks no longer reports as unpaid has\n// been paid. Closing it here is what stops a paid invoice being chased.\nfor (const r of stateRows) {\n  const s = r.json || {};\n  if (!s.invoice_id) continue;\n  if (seen[s.invoice_id]) continue;\n  out.push({\n    json: {\n      action: 'close_paid',\n      invoiceId: s.invoice_id,\n      invoiceNumber: s.invoice_number || '',\n      customerName: s.customer_name || '',\n      customerId: s.customer_id || '',\n      contactEmail: s.contact_email || '',\n      collectionStage: 'closed',\n      daysOverdue: 0,\n      amountDue: 0,\n      currency: 'USD',\n      timesContactedNext: Number(s.times_contacted || 0),\n      accountOwner: s.assigned_owner || 'unassigned',\n      customerStatus: 'paid',\n      emailSubject: ''\n    }\n  });\n}\n\nreturn out;"
+      },
+      "id": "9162a3a4-361c-4d71-a01e-d03fa9ec628a",
+      "name": "Decide Who To Remind Today",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "close_paid"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Paid - close it"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "courtesy"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Friendly reminder"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "chase"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Overdue reminder"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "final_notice"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Final notice"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Needs Review"
+        }
+      },
+      "id": "83a91a0b-c515-48d8-b29c-ac9958b5668c",
+      "name": "Route By Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1424,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE talentbridge.collection_state\nSET collection_stage = 'closed',\n    days_overdue = 0,\n    next_action_date = NULL,\n    promise_to_pay_date = NULL,\n    closed_at = NOW()\nWHERE invoice_id = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.invoiceId }}"
+        }
+      },
+      "id": "2d399970-45ae-4c26-92c9-407e94d923ff",
+      "name": "Postgres - Mark Invoice Paid",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "retryOnFail": true,
+      "position": [
+        1648,
+        432
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Write the body of a collections email for TalentBridge Staffing.\n\nCOLLECTION STAGE: {{ $('Decide Who To Remind Today').item.json.collectionStage }} (action: {{ $('Decide Who To Remind Today').item.json.action }})\nCustomer: {{ $('Decide Who To Remind Today').item.json.customerName }}\nCustomer status: {{ $('Decide Who To Remind Today').item.json.customerStatus }}\nAccount owner: {{ $('Decide Who To Remind Today').item.json.accountOwner }}\nInvoice: {{ $('Decide Who To Remind Today').item.json.invoiceNumber }}\nAmount outstanding: {{ $('Decide Who To Remind Today').item.json.currency }} {{ $('Decide Who To Remind Today').item.json.amountDue }}\nDue date: {{ $('Decide Who To Remind Today').item.json.dueDate }}\nDays overdue: {{ $('Decide Who To Remind Today').item.json.daysOverdue }}\nTimes already contacted: {{ $('Decide Who To Remind Today').item.json.timesContacted }}\nBroke a previous promise to pay: {{ $('Decide Who To Remind Today').item.json.promiseBroken }}\nOpen deals with this account in Pipedrive: {{ $('Decide Who To Remind Today').item.json.openDealsCount }}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You write accounts-receivable emails for TalentBridge Staffing, a contract staffing agency. You write the BODY ONLY - no subject line, no markdown, no placeholders like [Name].\n\nAPPROVED COLLECTION POLICY - you must stay inside it:\n\n1. TONE BY STAGE. pre_due/due: warm, purely administrative, assume nothing is wrong. od_1_7: light touch, assume an oversight. od_8_14: direct, ask for a payment date. od_15_30: firm, name the amount and ask for a commitment in writing. od_30_plus: formal final notice - state that placements may be paused and the account may be referred, but NEVER threaten legal action, collection agencies, credit reporting, or interest charges that have not been contractually agreed.\n\n2. NEVER invent facts. Do not invent contract terms, late fees, interest rates, timesheet details, contractor names or counts, or prior conversations. Only use the figures given to you.\n\n3. NEVER accuse. The customer may have already paid, or never received the invoice. Always leave room for that - offer to resend the invoice.\n\n4. If they broke a promise to pay, reference it once, factually and without sarcasm, and ask for a firm new date.\n\n5. ALWAYS give one clear next step and make it easy to reply. Always offer to send a copy of the invoice.\n\n6. Sign off as the accounts team and name the account owner as the contact for anything commercial.\n\n7. Keep it under 150 words. Short emails get paid faster than long ones.\n\n8. Staffing context: these invoices cover placed contractors. If the customer queries headcount or hours, that is a dispute for a human - do not argue the numbers in the email."
+            }
+          ]
+        },
+        "batching": {
+          "batchSize": 3,
+          "delayBetweenBatches": 1000
+        }
+      },
+      "id": "6b41eddf-ba44-411b-8c73-465c23bf7cc7",
+      "name": "AI Writes Reminder Email",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        2752,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "cachedResultName": "gpt-5.4",
+          "mode": "list",
+          "value": "gpt-5.4"
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.3
+        }
+      },
+      "id": "b5872273-ea47-4875-af9f-1232165acdcf",
+      "name": "AI Model - Write Email",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        2752,
+        832
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SLACK_CHANNEL_ID"
+        },
+        "text": "=:rotating_light: *Invoice 30+ days overdue - final notice going out*\n\n*{{ $json.customerName }}* | account owner: {{ $json.accountOwner }}\nInvoice *{{ $json.invoiceNumber }}* | {{ $json.currency }} {{ $json.amountDue }}\nDue {{ $json.dueDate }} - *{{ $json.daysOverdue }} days overdue*\nAlready contacted {{ $json.timesContacted }} times\nBroke a promise to pay: {{ $json.promiseBroken ? \"Yes\" : \"No\" }}\n\nOpen deals with this client in Pipedrive: {{ $json.openDealsCount }} - worth a call before this goes further.\nThis is the only final notice: after it, reminders stop and the account owner takes over.",
+        "otherOptions": {}
+      },
+      "id": "fa21186b-bf34-4157-9acc-9ee20b3628a7",
+      "name": "Slack - Alert Owner Before Final Notice",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        2080,
+        672
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "activity",
+        "subject": "=Final notice sent - invoice {{ $('Decide Who To Remind Today').item.json.invoiceNumber }} ({{ $('Decide Who To Remind Today').item.json.daysOverdue }} days overdue)",
+        "type": "call",
+        "additionalFields": {
+          "due_date": "={{ $now.plus(1, \"days\").toFormat(\"yyyy-MM-dd\") }}",
+          "note": "=Invoice {{ $('Decide Who To Remind Today').item.json.invoiceNumber }} for {{ $('Decide Who To Remind Today').item.json.currency }} {{ $('Decide Who To Remind Today').item.json.amountDue }} is {{ $('Decide Who To Remind Today').item.json.daysOverdue }} days overdue. A final notice has been emailed automatically. Call the client before taking it further.",
+          "org_id": "={{ $('Decide Who To Remind Today').item.json.pipedriveOrgId }}"
+        }
+      },
+      "id": "1e899941-f46b-4d61-ac15-60afa1b08cdf",
+      "name": "Pipedrive - Log Final Notice",
+      "type": "n8n-nodes-base.pipedrive",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        672
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SLACK_CHANNEL_ID"
+        },
+        "text": "=:grey_question: *Invoice needs a person to check*\nInvoice {{ $json.invoiceNumber }} | {{ $json.customerName }}\n{{ $json.action === \"no_contact\" ? \"No billing email on file - nobody to send reminders to. Add one to continue.\" : \"This invoice didn't fit any reminder rule. Please check it.\" }}\nOwner: {{ $json.accountOwner }} | {{ $json.currency }} {{ $json.amountDue }} | {{ $json.daysOverdue }} days overdue",
+        "otherOptions": {}
+      },
+      "id": "9a33b392-106a-4379-9cae-7035ec7c171a",
+      "name": "Slack - Needs Manual Review",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        2080,
+        848
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Decide Who To Remind Today').item.json.contactEmail }}",
+        "subject": "={{ $('Decide Who To Remind Today').item.json.emailSubject }}",
+        "emailType": "text",
+        "message": "={{ $json.text }}",
+        "options": {
+          "appendAttribution": false,
+          "senderName": "TalentBridge Staffing Accounts"
+        }
+      },
+      "id": "4fa422ac-0c32-4bab-94ac-ebbee81dda1b",
+      "name": "Gmail - Send Reminder",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "position": [
+        3264,
+        576
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "talentbridge"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "YOUR_AIRTABLE_TABLE_ID"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "invoice_id"
+          ],
+          "value": {
+            "assigned_owner": "={{ $('Decide Who To Remind Today').item.json.accountOwner }}",
+            "collection_stage": "={{ $('Decide Who To Remind Today').item.json.action === 'final_notice' ? 'final_notice_sent' : $('Decide Who To Remind Today').item.json.collectionStage }}",
+            "contact_email": "={{ $('Decide Who To Remind Today').item.json.contactEmail }}",
+            "customer_id": "={{ $('Decide Who To Remind Today').item.json.customerId }}",
+            "customer_name": "={{ $('Decide Who To Remind Today').item.json.customerName }}",
+            "days_overdue": "={{ $('Decide Who To Remind Today').item.json.daysOverdue }}",
+            "invoice_id": "={{ $('Decide Who To Remind Today').item.json.invoiceId }}",
+            "invoice_number": "={{ $('Decide Who To Remind Today').item.json.invoiceNumber }}",
+            "last_contacted": "={{ $now.toISO() }}",
+            "next_action_date": "={{ $('Decide Who To Remind Today').item.json.nextActionDate }}",
+            "times_contacted": "={{ $('Decide Who To Remind Today').item.json.timesContactedNext }}",
+            "promise_to_pay_date": "={{ null }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "b5497b42-9167-4162-a883-7b453176513e",
+      "name": "Postgres - Save Contact Made",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "retryOnFail": true,
+      "position": [
+        3488,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "base": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_AIRTABLE_BASE_ID",
+          "cachedResultName": "TalentBridge AR Dashboard"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "list",
+          "value": "YOUR_AIRTABLE_TABLE_ID",
+          "cachedResultName": "Invoice Dashboard"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "invoiceNumber"
+          ],
+          "value": {
+            "accountOwner": "={{ $('Decide Who To Remind Today').item.json.accountOwner }}",
+            "amountDue": "={{ $('Decide Who To Remind Today').item.json.amountDue }}",
+            "collectionStage": "={{ $('Decide Who To Remind Today').item.json.collectionStage }}",
+            "customerName": "={{ $('Decide Who To Remind Today').item.json.customerName }}",
+            "daysOverdue": "={{ $('Decide Who To Remind Today').item.json.daysOverdue }}",
+            "invoiceNumber": "={{ $('Decide Who To Remind Today').item.json.invoiceNumber }}",
+            "lastContacted": "={{ $now.toFormat(\"yyyy-MM-dd\") }}",
+            "outcome": "={{ $('Decide Who To Remind Today').item.json.action === 'close_paid' ? 'paid' : 'chased' }}"
+          }
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "id": "02eac763-5516-4c23-b68e-ff655e18133b",
+      "name": "Airtable - Update Dashboard",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        3696,
+        432
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyX",
+              "value": 5,
+              "unit": "minutes"
+            }
+          ]
+        },
+        "simple": false,
+        "maxResults": 25,
+        "filters": {
+          "q": "subject:\"TalentBridge Staffing - invoice\" -from:me newer_than:14d",
+          "readStatus": "unread"
+        },
+        "options": {}
+      },
+      "id": "44f652cc-ca71-4dc1-aa52-e54c705a9922",
+      "name": "New Customer Reply",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        1440
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "msg-id",
+              "name": "messageId",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "thread-id",
+              "name": "threadId",
+              "value": "={{ $json.threadId }}",
+              "type": "string"
+            },
+            {
+              "id": "from",
+              "name": "fromEmail",
+              "value": "={{ $json.from?.value?.[0]?.address ?? $json.from ?? \"\" }}",
+              "type": "string"
+            },
+            {
+              "id": "from-name",
+              "name": "fromName",
+              "value": "={{ $json.from?.value?.[0]?.name ?? \"\" }}",
+              "type": "string"
+            },
+            {
+              "id": "subject",
+              "name": "subject",
+              "value": "={{ $json.subject ?? \"\" }}",
+              "type": "string"
+            },
+            {
+              "id": "body",
+              "name": "bodyText",
+              "value": "={{ ($json.text ?? $json.snippet ?? \"\").slice(0, 4000) }}",
+              "type": "string"
+            },
+            {
+              "id": "received",
+              "name": "receivedAt",
+              "value": "={{ $now.toISO() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "e63df762-50d4-42a3-b8eb-bbbdd2b7770e",
+      "name": "Clean Up Reply",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        224,
+        1440
+      ]
+    },
+    {
+      "parameters": {
+        "text": "=Subject: {{ $json.subject }}\nFrom: {{ $json.fromName }} {{ $json.fromEmail }}\n\n{{ $json.bodyText }}",
+        "schemaType": "fromJson",
+        "jsonSchemaExample": "{ \"intent\": \"promise_to_pay\", \"invoiceNumber\": \"INV-1292\", \"promiseDate\": \"2026-09-18\", \"amountMentioned\": 4820.5, \"disputeReason\": \"\", \"newContactEmail\": \"\", \"confidence\": 0.94, \"reasoning\": \"Customer states they will settle INV-1292 on Friday.\" }",
+        "options": {
+          "systemPromptTemplate": "You classify replies to accounts-receivable emails for a staffing agency and extract the facts needed to act on them.\n\nintent MUST be exactly one of:\n- promise_to_pay: they commit to paying, with or without a specific date\n- payment_already_sent: they claim payment has already been made or is in the current payment run\n- invoice_dispute: they disagree with the amount, the headcount, the hours, the rates, the PO, or say they were never engaged. ANY disagreement with what is being billed is a dispute.\n- need_invoice_copy: they ask for the invoice, a copy, a statement, or a PO reference\n- wrong_contact: this is not the right person; they name someone else or a shared AP inbox\n- payment_question: a genuine question about how or when to pay, remittance details, or payment terms, with no disagreement about the amount\n- other: anything else, including out-of-office replies and bounces\n\nRules:\n- promiseDate MUST be an absolute date in YYYY-MM-DD form. Resolve relative language such as this Friday or end of next week against the email date. If they promise to pay but give no date at all, leave promiseDate empty and still use intent promise_to_pay.\n- invoiceNumber: copy it exactly as written if present, otherwise leave empty. Never invent one.\n- disputeReason: fill this ONLY for invoice_dispute, quoting the stated reason in one line.\n- newContactEmail: fill this ONLY for wrong_contact, and only if they actually give an address.\n- When a reply contains both a dispute and a promise, classify it as invoice_dispute. A disagreement outranks a commitment.\n- confidence is 0 to 1. reasoning is one short sentence explaining the call."
+        }
+      },
+      "id": "6c95dd41-89b4-42b6-aa4e-ffa232c7d496",
+      "name": "Classify Reply Intent",
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1.2,
+      "retryOnFail": true,
+      "position": [
+        448,
+        1440
+      ]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "cachedResultName": "gpt-5.4-mini",
+          "mode": "list",
+          "value": "gpt-5.4-mini"
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "8fffabc3-56a5-492e-ac8c-490868f90548",
+      "name": "AI Model - Read Reply",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        528,
+        1648
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT *\nFROM talentbridge.collection_state\nWHERE ( $1 <> '' AND invoice_number = $1\n        AND lower(split_part(contact_email, '@', 2)) = lower(split_part($2, '@', 2)) )\n   OR ( $1 = ''  AND lower(contact_email) = lower($2) AND collection_stage <> 'closed' )\nORDER BY days_overdue DESC\nLIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ $json.output.invoiceNumber || '' }},{{ $('Clean Up Reply').item.json.fromEmail }}"
+        }
+      },
+      "id": "30fb784f-6ab3-4e08-b884-74e65ec1c3cc",
+      "name": "Postgres - Find Invoice In State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "position": [
+        736,
+        1440
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.invoice_id }}",
+              "operator": {
+                "type": "string",
+                "operation": "exists"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "57e50ab6-9d17-42e6-a42d-38d8420ce6f5",
+      "name": "Invoice Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        896,
+        1440
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Classify Reply Intent').item.json.output.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "invoice_dispute",
+                    "id": "672cda2e-6e3f-4d08-8e9f-12cd60249358"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Dispute"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Classify Reply Intent').item.json.output.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "promise_to_pay",
+                    "id": "38b08e56-2686-4135-ab9f-be65661d82f9"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Promised to pay"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Classify Reply Intent').item.json.output.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "payment_already_sent",
+                    "id": "a4c2cbec-8f44-404d-af03-b7865a09b4e7"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Says already paid"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Classify Reply Intent').item.json.output.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "need_invoice_copy",
+                    "id": "2d4b7af7-67a3-4e3b-9fe0-af777a7c7941"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Wants invoice copy"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Classify Reply Intent').item.json.output.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "wrong_contact",
+                    "id": "1d4fc08a-1b15-4693-9581-c71b793fcd70"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Wrong contact"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Classify Reply Intent').item.json.output.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "payment_question",
+                    "id": "71373852-bd18-4ac6-ac3a-6483b07bd559"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Payment question"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Other"
+        }
+      },
+      "id": "06b4e5eb-291e-424a-a45e-d97eadec3abe",
+      "name": "Route By Reply Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1120,
+        1344
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE talentbridge.collection_state\nSET dispute_status      = 'open',\n    collection_stage    = 'disputed',\n    last_response       = NOW(),\n    next_action_date    = NULL,\n    promise_to_pay_date = NULL\nWHERE invoice_id = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.invoice_id }}"
+        }
+      },
+      "id": "1967078f-4a0e-4919-b3a4-b5e0c66f7f54",
+      "name": "Postgres - STOP REMINDERS (Dispute)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "retryOnFail": true,
+      "position": [
+        1392,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "activity",
+        "subject": "=Invoice dispute raised - {{ $('Postgres - Find Invoice In State').item.json.invoice_number }}",
+        "type": "task",
+        "additionalFields": {
+          "due_date": "={{ $now.toFormat(\"yyyy-MM-dd\") }}",
+          "note": "=Customer disputed invoice {{ $('Postgres - Find Invoice In State').item.json.invoice_number }}.\n\nReason given: {{ $('Classify Reply Intent').item.json.output.disputeReason }}\n\nReminders have been STOPPED for this invoice. They won't restart until dispute_status is cleared in the collection_state table.\n\nOriginal reply:\n{{ $('Clean Up Reply').item.json.bodyText }}"
+        }
+      },
+      "id": "7679ded3-4995-480f-8caa-66eccb366d7f",
+      "name": "Pipedrive - Create Dispute Activity",
+      "type": "n8n-nodes-base.pipedrive",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        1248
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SLACK_CHANNEL_ID"
+        },
+        "text": "=:no_entry: *INVOICE DISPUTED - reminders stopped*\n\n*{{ $('Postgres - Find Invoice In State').item.json.customer_name }}*\nInvoice *{{ $('Postgres - Find Invoice In State').item.json.invoice_number }}* | account owner: {{ $('Postgres - Find Invoice In State').item.json.assigned_owner }}\n\n*Reason given:* {{ $('Classify Reply Intent').item.json.output.disputeReason }}\n\nNo more reminders will be sent for this invoice. The emails are saved to Google Drive. The account manager and finance should sort it out, then set dispute_status back to \"none\" in the database to restart reminders.",
+        "otherOptions": {}
+      },
+      "id": "f044fdbc-b5c5-4cf7-8e3b-66e130f96b4e",
+      "name": "Slack - Dispute Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1840,
+        1248
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "createFromText",
+        "content": "=INVOICE DISPUTE RECORD\nInvoice:        {{ $('Postgres - Find Invoice In State').item.json.invoice_number }}\nCustomer:       {{ $('Postgres - Find Invoice In State').item.json.customer_name }}\nDays overdue:   {{ $('Postgres - Find Invoice In State').item.json.days_overdue }}\nAccount owner:  {{ $('Postgres - Find Invoice In State').item.json.assigned_owner }}\nRaised:         {{ $now.toISO() }}\nRun ID:         {{ $execution.id }}\n\nReason given:   {{ $('Classify Reply Intent').item.json.output.disputeReason }}\nAI confidence:  {{ $('Classify Reply Intent').item.json.output.confidence }}\n\nFrom: {{ $('Clean Up Reply').item.json.fromName }} {{ $('Clean Up Reply').item.json.fromEmail }}\nSubject: {{ $('Clean Up Reply').item.json.subject }}\n\n--- ORIGINAL MESSAGE ---\n{{ $('Clean Up Reply').item.json.bodyText }}",
+        "name": "=dispute_{{ $('Postgres - Find Invoice In State').item.json.invoice_number }}_{{ $now.toFormat('yyyyMMdd-HHmmss') }}.txt",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "YOUR_DRIVE_ID"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "YOUR_DRIVE_FOLDER_ID",
+          "cachedResultName": "/ (Root folder)"
+        },
+        "options": {}
+      },
+      "id": "d1ed90aa-0167-4999-af47-dc1354a780dd",
+      "name": "Drive - Save Dispute Emails",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        2064,
+        1248
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE talentbridge.collection_state\nSET promise_to_pay_date = COALESCE(NULLIF($2, '')::date, CURRENT_DATE + 7),\n    collection_stage    = 'promised',\n    last_response       = NOW(),\n    next_action_date    = COALESCE(NULLIF($2, '')::date, CURRENT_DATE + 7) + 1,\n    dispute_status      = 'none'\nWHERE invoice_id = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.invoice_id }},{{ $('Classify Reply Intent').item.json.output.promiseDate || '' }}"
+        }
+      },
+      "id": "029ad1ba-9a42-49b0-a70c-219847b5a1ea",
+      "name": "Postgres - Save Promised Payment Date",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "retryOnFail": true,
+      "position": [
+        1472,
+        1664
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE talentbridge.collection_state\nSET collection_stage    = 'payment_claimed',\n    last_response       = NOW(),\n    next_action_date    = CURRENT_DATE + 1,\n    promise_to_pay_date = NULL\nWHERE invoice_id = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.invoice_id }}"
+        }
+      },
+      "id": "f39132cd-408e-4644-8ae7-b13d450a092e",
+      "name": "Postgres - Customer Says Paid",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "retryOnFail": true,
+      "position": [
+        1472,
+        1840
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "reply",
+        "messageId": "={{ $('Clean Up Reply').item.json.messageId }}",
+        "emailType": "text",
+        "message": "=Hi {{ $('Clean Up Reply').item.json.fromName }},\n\nOf course - I've asked our accounts team to resend invoice {{ $('Postgres - Find Invoice In State').item.json.invoice_number }} from QuickBooks, our accounting system, so you have the official copy.\n\nIf anything on it doesn't match your records, just reply here and we'll look into it before anything else goes out.\n\nMany thanks,\nAccounts - TalentBridge Staffing",
+        "options": {
+          "appendAttribution": false,
+          "senderName": "TalentBridge Staffing Accounts"
+        }
+      },
+      "id": "de05d0be-15c0-438b-a82a-402f74e4cecd",
+      "name": "Gmail - Reply With Invoice Copy",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "retryOnFail": true,
+      "position": [
+        1472,
+        2032
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE talentbridge.collection_state\nSET collection_stage = 'copy_sent',\n    last_response    = NOW(),\n    next_action_date = CURRENT_DATE + 3\nWHERE invoice_id = $1;",
+        "options": {
+          "queryReplacement": "={{ $('Postgres - Find Invoice In State').item.json.invoice_id }}"
+        }
+      },
+      "id": "db980a05-8d5c-4522-8b6f-824fb8ad4b53",
+      "name": "Postgres - Pause For Invoice Copy",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "retryOnFail": true,
+      "position": [
+        2112,
+        2032
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE talentbridge.collection_state\nSET contact_email    = COALESCE(NULLIF($2, ''), contact_email),\n    collection_stage = CASE WHEN NULLIF($2, '') IS NULL THEN 'wrong_contact' ELSE 'active' END,\n    next_action_date = CASE WHEN NULLIF($2, '') IS NULL THEN NULL ELSE CURRENT_DATE END,\n    last_response    = NOW()\nWHERE invoice_id = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.invoice_id }},{{ $('Classify Reply Intent').item.json.output.newContactEmail || '' }}"
+        }
+      },
+      "id": "88f6c46f-35d3-44ad-a420-39cdb432d52b",
+      "name": "Postgres - Update Wrong Contact",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "retryOnFail": true,
+      "position": [
+        1472,
+        2224
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SLACK_CHANNEL_ID"
+        },
+        "text": "=:busts_in_silhouette: *Wrong billing contact* - {{ $('Postgres - Find Invoice In State').item.json.customer_name }}\nInvoice {{ $('Postgres - Find Invoice In State').item.json.invoice_number }} | owner: {{ $('Postgres - Find Invoice In State').item.json.assigned_owner }}\n\nNew email given: {{ $('Classify Reply Intent').item.json.output.newContactEmail || 'NONE - reminders are PAUSED until someone adds one' }}",
+        "otherOptions": {}
+      },
+      "id": "66113368-f1e4-4e0c-9ef7-1866d213b4e6",
+      "name": "Slack - Wrong Contact",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1760,
+        2224
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SLACK_CHANNEL_ID"
+        },
+        "text": "=:question: *Customer has a payment question - needs a person*\n{{ $('Postgres - Find Invoice In State').item.json.customer_name }} | invoice {{ $('Postgres - Find Invoice In State').item.json.invoice_number }} | owner: {{ $('Postgres - Find Invoice In State').item.json.assigned_owner }}\n\nReminders paused for 2 days so we don't chase someone who is trying to pay.",
+        "otherOptions": {}
+      },
+      "id": "7e73363c-4753-4d91-ae5f-1e2522bbf7c6",
+      "name": "Slack - Payment Question",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1472,
+        2416
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE talentbridge.collection_state\nSET collection_stage = 'question_pending',\n    last_response    = NOW(),\n    next_action_date = CURRENT_DATE + 2\nWHERE invoice_id = $1;",
+        "options": {
+          "queryReplacement": "={{ $('Postgres - Find Invoice In State').item.json.invoice_id }}"
+        }
+      },
+      "id": "80da56b0-b4e4-4d1c-b067-1ecbc68b9b4e",
+      "name": "Postgres - Pause For Question",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "retryOnFail": true,
+      "position": [
+        1760,
+        2416
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SLACK_CHANNEL_ID"
+        },
+        "text": "=:inbox_tray: *Reply didn't fit any category* - {{ $('Postgres - Find Invoice In State').item.json.customer_name }}\nInvoice {{ $('Postgres - Find Invoice In State').item.json.invoice_number }}\nAI's note: {{ $('Classify Reply Intent').item.json.output.reasoning }}",
+        "otherOptions": {}
+      },
+      "id": "ebeb7dbe-9156-4c99-8402-00a797382e9f",
+      "name": "Slack - Other Reply",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1472,
+        2640
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SLACK_CHANNEL_ID"
+        },
+        "text": "=:mailbox_with_no_mail: *Customer reply couldn't be matched to an invoice*\nFrom: {{ $('Clean Up Reply').item.json.fromName }} {{ $('Clean Up Reply').item.json.fromEmail }}\nSubject: {{ $('Clean Up Reply').item.json.subject }}\nAI says it's: *{{ $('Classify Reply Intent').item.json.output.intent }}*\n\nNo open invoice found. Please handle manually.",
+        "otherOptions": {}
+      },
+      "id": "94b83ffc-4c4f-452e-938e-b437986ad413",
+      "name": "Slack - Reply Not Matched",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1120,
+        1808
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "talentbridge"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "YOUR_AIRTABLE_TABLE_ID"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "invoice_id": "={{ $('Postgres - Find Invoice In State').item.json.invoice_id }}",
+            "event_type": "reply",
+            "intent": "={{ $('Classify Reply Intent').item.json.output.intent }}",
+            "confidence": "={{ $('Classify Reply Intent').item.json.output.confidence }}",
+            "detail": "={{ $('Classify Reply Intent').item.json.output.reasoning }}",
+            "execution_id": "={{ $execution.id }}",
+            "created_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "2d11443a-5185-443c-8c97-fc0f4424a06a",
+      "name": "Postgres - Log Reply",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "retryOnFail": true,
+      "position": [
+        2560,
+        1888
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "base": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_AIRTABLE_BASE_ID",
+          "cachedResultName": "TalentBridge AR Dashboard"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "list",
+          "value": "YOUR_AIRTABLE_TABLE_ID",
+          "cachedResultName": "Invoice Dashboard"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "invoiceNumber"
+          ],
+          "value": {
+            "invoiceNumber": "={{ $('Postgres - Find Invoice In State').item.json.invoice_number }}",
+            "customerName": "={{ $('Postgres - Find Invoice In State').item.json.customer_name }}",
+            "accountOwner": "={{ $('Postgres - Find Invoice In State').item.json.assigned_owner }}",
+            "lastResponse": "={{ $now.toFormat(\"yyyy-MM-dd\") }}",
+            "lastIntent": "={{ $('Classify Reply Intent').item.json.output.intent }}",
+            "outcome": "replied"
+          }
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "id": "c51fce2b-e0c2-4cdb-aee0-4b1cbad43c9c",
+      "name": "Airtable - Update Dashboard (Reply)",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        2768,
+        1888
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "id": "15aa1967-0346-4a92-8941-21c1fadd0a3f",
+      "name": "When Workflow Fails",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        3216,
+        1296
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "wf",
+              "name": "workflowName",
+              "value": "={{ $json.workflow?.name ?? \"TalentBridge AR Chaser\" }}",
+              "type": "string"
+            },
+            {
+              "id": "node",
+              "name": "failedNode",
+              "value": "={{ $json.execution?.lastNodeExecuted ?? \"unknown\" }}",
+              "type": "string"
+            },
+            {
+              "id": "msg",
+              "name": "errorMessage",
+              "value": "={{ $json.execution?.error?.message ?? \"no message\" }}",
+              "type": "string"
+            },
+            {
+              "id": "url",
+              "name": "executionUrl",
+              "value": "={{ $json.execution?.url ?? \"\" }}",
+              "type": "string"
+            },
+            {
+              "id": "exec",
+              "name": "executionId",
+              "value": "={{ $json.execution?.id ?? \"\" }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d2ad27cc-b47b-470d-a371-6ce162d4f329",
+      "name": "Build Error Summary",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3440,
+        1296
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SLACK_CHANNEL_ID"
+        },
+        "text": "=:warning: *Invoice reminder workflow failed*\nWorkflow: {{ $json.workflowName }}\nStep that failed: *{{ $json.failedNode }}*\nError: {{ $json.errorMessage }}\n{{ $json.executionUrl }}\n\nNothing retries automatically - any invoice missed today will be picked up in tomorrow morning's run.",
+        "otherOptions": {}
+      },
+      "id": "0d0e22bb-8239-4b8d-b442-077f8d816a73",
+      "name": "Slack - Workflow Failed",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        3664,
+        1296
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "talentbridge"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "YOUR_AIRTABLE_TABLE_ID"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "workflow_name": "={{ $json.workflowName }}",
+            "failed_node": "={{ $json.failedNode }}",
+            "error_message": "={{ $json.errorMessage }}",
+            "execution_url": "={{ $json.executionUrl }}",
+            "execution_id": "={{ $json.executionId }}",
+            "failed_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "19ff780d-d7ca-4061-bede-72955681ed33",
+      "name": "Postgres - Save To Error Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        3664,
+        1456
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## 1 · Get data from three places\n\nQuickBooks has the invoices, amounts owed and each customer's billing email. Pipedrive has the client relationship. Postgres (the database) remembers past reminders.\n\n**QuickBooks customers, Pipedrive and Postgres run only once per daily run**, not once per invoice. Otherwise 200 invoices would mean 200 identical lookups.\n\nBoth retry 3 times if the service is briefly down, so a hiccup doesn't skip a day.",
+        "height": 1024,
+        "width": 1200,
+        "color": 7
+      },
+      "id": "8943d2ea-f73d-4619-a8df-f5e7ed3a3851",
+      "name": "Sticky Note dcf66154",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -64,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 2 · Fixed rules decide who gets a reminder - no AI\n\nWhich invoice gets a reminder, when, and how firm it is follows **company policy**, so it's never left to AI.\n\nGroups: Not due yet · Due today · 1-7 days late · 8-14 · 15-30 · 30+\n\nThe \"never send\" rules matter most:\n- invoice is disputed → no reminders\n- wrong contact → no reminders\n- customer promised a date that hasn't passed → wait\n- minimum days between reminders → no daily nagging\n- final notice already sent → no more emails; the account owner takes over\n\nIt also closes any invoice that's open in the database but no longer unpaid in QuickBooks. **That's what stops paid invoices getting reminders.**",
+        "height": 1024,
+        "width": 740,
+        "color": 4
+      },
+      "id": "51b9e751-a3e0-4a2d-b7de-225a04a047f7",
+      "name": "Sticky Note 995fba3f",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1152,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 3 · AI writes the email - within the rules\n\nThe AI writes only the email body. The subject line is built by fixed rules, so the invoice number can never be wrong.\n\nThe AI follows the **approved reminder policy**: tone gets firmer the later the invoice, no made-up contract terms or late fees, no accusations, no legal threats - and any disagreement about headcount or hours goes to a person instead of being argued by email.\n\nWrites 3 emails at a time to stay within OpenAI usage limits.",
+        "height": 1024,
+        "width": 560,
+        "color": 6
+      },
+      "id": "18d1ce7f-728b-4496-b844-e2886de0d725",
+      "name": "Sticky Note b437b51a",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2640,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 4 · Send, then record it\n\n**Postgres - Save Contact Made** updates the invoice's row, or creates it if new. The database allows only one row per invoice, so duplicates can't happen - even if the workflow runs twice.\n\nIt also adds 1 to the contact count, which decides how firm the next reminder is.\n\nIf one email fails to send, it goes to Slack and the rest of the batch is still sent and recorded - so nothing already sent goes out twice.\n\nThis is why a real database is used instead of a spreadsheet: the database itself blocks duplicates.",
+        "height": 1024,
+        "width": 960,
+        "color": 5
+      },
+      "id": "2e0aa330-e9c2-435d-aaaf-4efdf4b91e59",
+      "name": "Sticky Note 77a0c807",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 5 · 30+ days late - tell a person first\n\nBefore the final notice goes out, the account owner gets a Slack alert and a follow-up task is added in Pipedrive.\n\nFor a staffing agency, sending a harsh notice to a big client without the account manager knowing can lose the whole client, not just the invoice. The alert shows how many open deals the client has in Pipedrive next to the amount owed. Only one final notice is ever sent.",
+        "height": 1024,
+        "width": 720,
+        "color": 3
+      },
+      "id": "cc64836b-2799-4e4d-a8ab-3342cc51ee6f",
+      "name": "Sticky Note a269e06c",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1904,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 6 · AI reads customer replies\n\nOnly replies to our reminders are picked up (subject contains \"TalentBridge Staffing - invoice\"). An invoice number in a reply only counts if the sender's email domain matches the invoice contact's - otherwise it goes to a person.\n\nOne AI step does two things: decides what kind of reply it is, **and** pulls out the details needed - promised payment date, invoice number, dispute reason, new contact email.\n\nDates like \"this Friday\" are turned into exact dates.\n\nTwo key rules:\n- if a reply both disputes and promises to pay, it's treated as a **dispute**\n- never make up an invoice number\n\nThe invoice lookup always continues even when nothing matches, because unmatched replies have their own path.",
+        "height": 952,
+        "width": 1400,
+        "color": 6
+      },
+      "id": "79e82c92-0718-4b7c-ade7-4f0bfbf3a3ac",
+      "name": "Sticky Note 31d78bca",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -64,
+        1040
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 7 · Dispute = STOP reminders\n\nA dispute marks the invoice as disputed and removes its next reminder date. The daily run then skips it completely.\n\nReminders only restart when a person clears the dispute. On purpose: no timer, no automatic restart.\n\nPipedrive gets a task, Slack gets an alert, and Google Drive keeps a copy of the emails - so the dispute stays visible even though reminders have stopped.",
+        "height": 368,
+        "width": 1740,
+        "color": 3
+      },
+      "id": "770d087d-a8a0-4176-9450-8cf31d583f5e",
+      "name": "Sticky Note 2e8f7bfd",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1360,
+        1040
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 8 · Every other reply sets the next reminder date\n\nEvery path sets a next reminder date - an invoice without one would never be followed up again.\n\n- **Promised to pay** → day after the promised date. No date given? Wait 7 days.\n- **Says already paid** → check again tomorrow; QuickBooks will confirm. Never argue.\n- **Wants invoice copy** → reply in the same email thread, wait 3 days.\n- **Wrong contact** → new email given: restart today. None given: pause until someone adds one.\n- **Payment question** → wait 2 days while a person answers.",
+        "height": 1410,
+        "width": 1740,
+        "color": 4
+      },
+      "id": "760c1fd2-52b2-424b-bb06-46878d44ac8d",
+      "name": "Sticky Note 8ba1d2c4",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1360,
+        1424
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 9 · If something breaks\n\nThis branch runs whenever a live run fails. It works because the workflow is its own error workflow (**Settings > Error Workflow = this workflow**). If you import or duplicate it, select the copy there again. Manual test runs don't trigger it.\n\nNothing retries on purpose: tomorrow morning's run picks everything up again. Each reminder is recorded as soon as it is sent, and a send that fails goes to Slack instead of stopping the rest, so a failure costs one day, never a duplicate reminder.",
+        "height": 604,
+        "width": 1032,
+        "color": 3
+      },
+      "id": "a88e8361-464e-46da-93b1-4bebc093626b",
+      "name": "Sticky Note 43b44ac5",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3120,
+        1040
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Before this runs\n\n**PostgreSQL (database)** - create three tables in a schema named talentbridge (every query uses talentbridge.*). In collection_state, invoice_id must be the PRIMARY KEY, or step 4 will fail:\n\ncollection_state(invoice_id text PRIMARY KEY, invoice_number text, customer_id text, customer_name text, contact_email text, collection_stage text, days_overdue int, last_contacted timestamptz, last_response timestamptz, promise_to_pay_date date, dispute_status text default none, next_action_date date, assigned_owner text, times_contacted int default 0, closed_at timestamptz)\n\ncollection_events(id bigserial PRIMARY KEY, invoice_id text, event_type text, intent text, confidence numeric, detail text, execution_id text, created_at timestamptz)\n\nar_error_log(id bigserial PRIMARY KEY, workflow_name text, failed_node text, error_message text, execution_url text, execution_id text, failed_at timestamptz)\n\n**QuickBooks** - connect a QuickBooks credential in both QuickBooks steps (unpaid invoices and customers). Reminders go to the customer's primary email, or the invoice's billing email if the customer has none. The same QuickBooks company is shared with the Braewick workflow.\n**Pipedrive** - connect your account.\n**Airtable** - pick the dashboard table in both Airtable steps.\n**Gmail / Drive / Slack / OpenAI** - already connected.",
+        "height": 1028,
+        "width": 700,
+        "color": 2
+      },
+      "id": "7f88580c-5391-4012-8173-d9ecef35d7d4",
+      "name": "Sticky Note 043152a3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        4224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SLACK_CHANNEL_ID"
+        },
+        "text": "=:page_facing_up: *Customer asked for an invoice copy - please resend from QuickBooks*\n{{ $('Postgres - Find Invoice In State').item.json.customer_name }} | invoice *{{ $('Postgres - Find Invoice In State').item.json.invoice_number }}* | owner: {{ $('Postgres - Find Invoice In State').item.json.assigned_owner }}\nSend to: {{ $('Clean Up Reply').item.json.fromEmail }}\n\nWe've told the customer it's on its way. Reminders are paused for 3 days.",
+        "otherOptions": {}
+      },
+      "id": "6d1e31cf-54df-43dc-8f47-2b1dcb1d3f05",
+      "name": "Slack - Resend Invoice Copy",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1776,
+        2032
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SLACK_CHANNEL_ID"
+        },
+        "text": "=:warning: *Reminder email failed to send*\n{{ $('Decide Who To Remind Today').item.json.customerName }} | invoice {{ $('Decide Who To Remind Today').item.json.invoiceNumber }} | to {{ $('Decide Who To Remind Today').item.json.contactEmail }}\nError: {{ $json.error?.message || $json.error || 'unknown error' }}\n\nNothing was recorded for this invoice, so tomorrow's run tries again. The other reminders in this run were sent and recorded as normal.",
+        "otherOptions": {}
+      },
+      "id": "e6f7a8b9-2222-4d2e-8f3a-3b4c5d6e7f02",
+      "name": "Slack - Reminder Not Sent",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        3488,
+        768
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "invoice",
+        "operation": "getAll",
+        "returnAll": true,
+        "filters": {}
+      },
+      "id": "a7c1e3f5-2b4d-4e6f-8a1b-qbinvoices01",
+      "name": "QuickBooks - Unpaid Invoices",
+      "type": "n8n-nodes-base.quickbooks",
+      "typeVersion": 1,
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "position": [
+        224,
+        624
+      ],
+      "notes": "Fetches ALL invoices on purpose. A QuickBooks query on Balance returned nothing through this node, which would make every open invoice look paid. 'Decide Who To Remind Today' keeps only Balance > 0."
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "filters": {}
+      },
+      "id": "b8d2f4a6-3c5e-4f70-9b2c-qbcustomers1",
+      "name": "QuickBooks - Customers",
+      "type": "n8n-nodes-base.quickbooks",
+      "typeVersion": 1,
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "position": [
+        448,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.pipedrive.com/v1/organizations",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "pipedriveApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "limit",
+              "value": "500"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d29d1671-aae7-4f10-8d27-118952bfa9d8",
+      "name": "Pipedrive - Customer Context",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "position": [
+        672,
+        624
+      ],
+      "notes": "Pipedrive API v1 on purpose: it returns the owner's name and open_deals_count, which the v2 organisations list (used by the Pipedrive node) leaves out."
+    }
+  ],
+  "connections": {
+    "Postgres - Load Collection State": {
+      "main": [
+        [
+          {
+            "node": "Decide Who To Remind Today",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipedrive - Log Final Notice": {
+      "main": [
+        [
+          {
+            "node": "AI Writes Reminder Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Reply Intent": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Find Invoice In State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Find Invoice In State": {
+      "main": [
+        [
+          {
+            "node": "Invoice Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipedrive - Create Dispute Activity": {
+      "main": [
+        [
+          {
+            "node": "Slack - Dispute Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - Dispute Alert": {
+      "main": [
+        [
+          {
+            "node": "Drive - Save Dispute Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Pause For Invoice Copy": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Log Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Update Wrong Contact": {
+      "main": [
+        [
+          {
+            "node": "Slack - Wrong Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - Wrong Contact": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Log Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - Payment Question": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Pause For Question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Pause For Question": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Log Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Error Summary": {
+      "main": [
+        [
+          {
+            "node": "Slack - Workflow Failed",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Postgres - Save To Error Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Who To Remind Today": {
+      "main": [
+        [
+          {
+            "node": "Route By Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route By Action": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Mark Invoice Paid",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Writes Reminder Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Writes Reminder Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack - Alert Owner Before Final Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack - Needs Manual Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Mark Invoice Paid": {
+      "main": [
+        [
+          {
+            "node": "Airtable - Update Dashboard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Writes Reminder Email": {
+      "main": [
+        [
+          {
+            "node": "Gmail - Send Reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Model - Write Email": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Writes Reminder Email",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - Alert Owner Before Final Notice": {
+      "main": [
+        [
+          {
+            "node": "Pipedrive - Log Final Notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail - Send Reminder": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Save Contact Made",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack - Reminder Not Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Save Contact Made": {
+      "main": [
+        [
+          {
+            "node": "Airtable - Update Dashboard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Customer Reply": {
+      "main": [
+        [
+          {
+            "node": "Clean Up Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean Up Reply": {
+      "main": [
+        [
+          {
+            "node": "Classify Reply Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Model - Read Reply": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Classify Reply Intent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Invoice Found?": {
+      "main": [
+        [
+          {
+            "node": "Route By Reply Type",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack - Reply Not Matched",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route By Reply Type": {
+      "main": [
+        [
+          {
+            "node": "Postgres - STOP REMINDERS (Dispute)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres - Save Promised Payment Date",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres - Customer Says Paid",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gmail - Reply With Invoice Copy",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres - Update Wrong Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack - Payment Question",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack - Other Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - STOP REMINDERS (Dispute)": {
+      "main": [
+        [
+          {
+            "node": "Pipedrive - Create Dispute Activity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive - Save Dispute Emails": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Log Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Save Promised Payment Date": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Log Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Customer Says Paid": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Log Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - Other Reply": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Log Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Log Reply": {
+      "main": [
+        [
+          {
+            "node": "Airtable - Update Dashboard (Reply)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When Workflow Fails": {
+      "main": [
+        [
+          {
+            "node": "Build Error Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail - Reply With Invoice Copy": {
+      "main": [
+        [
+          {
+            "node": "Slack - Resend Invoice Copy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - Resend Invoice Copy": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Pause For Invoice Copy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every Day At 8:00": {
+      "main": [
+        [
+          {
+            "node": "QuickBooks - Unpaid Invoices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "QuickBooks - Unpaid Invoices": {
+      "main": [
+        [
+          {
+            "node": "QuickBooks - Customers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "QuickBooks - Customers": {
+      "main": [
+        [
+          {
+            "node": "Pipedrive - Customer Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipedrive - Customer Context": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Load Collection State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timezone": "Asia/Manila"
+  },
+  "pinData": {}
+}
