@@ -1235,8 +1235,7 @@
       "parameters": {
         "content": "## 1 · Get data from three places\n\nQuickBooks has the invoices, amounts owed and each customer's billing email. Pipedrive has the client relationship. Postgres (the database) remembers past reminders.\n\n**QuickBooks customers, Pipedrive and Postgres run only once per daily run**, not once per invoice. Otherwise 200 invoices would mean 200 identical lookups.\n\nBoth retry 3 times if the service is briefly down, so a hiccup doesn't skip a day.",
         "height": 1024,
-        "width": 1200,
-        "color": 7
+        "width": 1200
       },
       "id": "8943d2ea-f73d-4619-a8df-f5e7ed3a3851",
       "name": "Sticky Note dcf66154",
